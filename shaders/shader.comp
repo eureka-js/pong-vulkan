@@ -1,0 +1,306 @@
+#version 450
+
+struct BoundingBox {
+    float minX;
+    float maxX;
+    float minY;
+    float maxY;
+};
+
+struct Particle {
+    BoundingBox currBoundingBox;
+    BoundingBox prevBoundingBox;
+    vec4        color;
+    vec2        position;
+    vec2        currVelocity;
+    vec2        prevVelocityDeltaTimed;
+    float       size;
+};
+
+struct WorldEntity {
+    BoundingBox currBoundingBox;
+    BoundingBox prevBoundingBox;
+    vec2        currVelocity;
+    vec2        prevVelocity;
+    vec2        prevPrevVelocity;
+};
+
+struct SwapAABBResult {
+    float collisionTime;
+    vec2  normal;
+    vec3  color;
+};
+
+layout(std140, binding = 0) uniform ParameterUBO {
+    float prevPrevDeltaTime;
+    float prevDeltaTime;
+    float currDeltaTime;
+    float particleCurrDeltaTime;
+    float worldHeight;
+    float worldWidth;
+    float epsilon;
+} ubo;
+
+layout(std140, binding = 1) readonly buffer ParticleSSBOIn {
+    Particle particlesIn[ ];
+};
+
+layout(std140, binding = 2) buffer ParticleSSBOOut {
+    Particle particlesOut[ ];
+};
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (std140, binding = 3) readonly buffer WorldEntities {
+    WorldEntity worldEntities[ ];
+};
+
+
+BoundingBox createParticleBoundingBox(vec2 position, float size) {
+    BoundingBox box;
+
+    float halfSize = size / 2;
+    box.minX = position.x - halfSize;
+    box.maxX = position.x + halfSize;
+    box.minY = position.y - halfSize;
+    box.maxY = position.y + halfSize;
+
+    return box;
+}
+
+BoundingBox createSweptBoundingBox(BoundingBox box, vec2 velocity) {
+    box.minX = min(box.minX, box.minX + velocity.x);
+    box.maxX = max(box.maxX, box.maxX + velocity.x);
+    box.minY = min(box.minY, box.minY + velocity.y);
+    box.maxY = max(box.maxY, box.maxY + velocity.y);
+
+    return box;
+}
+
+BoundingBox createSweptBoundingBox(BoundingBox bb1, BoundingBox bb2) {
+    BoundingBox newBB;
+    newBB.minX = min(bb1.minX, bb2.minX);
+    newBB.maxX = max(bb1.maxX, bb2.maxX);
+    newBB.minY = min(bb1.minY, bb2.minY);
+    newBB.maxY = max(bb1.maxY, bb2.maxY);
+
+    return newBB;
+}
+
+bool AABB(BoundingBox box0, BoundingBox box1) {
+    return box0.minX <= box1.maxX && box0.maxX >= box1.minX && box0.minY <= box1.maxY && box0.maxY >= box1.minY;
+}
+
+bool doCollide(BoundingBox box0, BoundingBox box1) {
+    return AABB(box0, box1);
+}
+
+SwapAABBResult sweptAABB(
+    BoundingBox box0,
+    BoundingBox box1,
+    vec2        box0Vel,
+    vec2        box1Vel
+) {
+    // NOTE: This is a somewhat bastardized version of Swept AABB that more accurately determines the side of the box1
+    //  at which the box0 and box1 collided at. Pure Swept AABB doesn't determine that accurately because it calculates
+    //  the penetration from the sides (top, bottom, right, left) and not from the point of impact. (2025-10-24)
+    // NOTE: This is still a bit inaccurate in some edge cases where it might calculate that a particle collided on the
+    //  y axis instead of x or vice versa. Even though that is the case, that particle still behaves in line with the rest
+    //  of particles from that particle cluster; which doesn't warrant writing a more sophisticated version
+    //  of the Swept AABB algorithm, or a completely different algorithm. (2025-10-28)
+
+    SwapAABBResult result;
+
+    float box0VelX = box0Vel.x;
+    float box0VelY = box0Vel.y;
+    float box1VelX = box1Vel.x;
+    float box1VelY = box1Vel.y;
+
+    float finalVelX = box0VelX - box1VelX;
+    float finalVelY = box0VelY - box1VelY;
+
+    float xInvEntry;
+    float xInvExit;
+    float yInvEntry;
+    float yInvExit;
+    if (finalVelX > 0.0) {
+        xInvEntry = box1.minX - box0.maxX;
+        xInvExit  = box1.maxX - box0.minX;
+    } else {
+        xInvEntry = box1.maxX - box0.minX;
+        xInvExit  = box1.minX - box0.maxX;
+    }
+    if (finalVelY > 0.0) {
+        yInvEntry = box1.minY - box0.maxY;
+        yInvExit  = box1.maxY - box0.minY;
+    } else {
+        yInvEntry = box1.maxY - box0.minY;
+        yInvExit  = box1.minY - box0.maxY;
+    }
+
+    float xEntry;
+    float xExit;
+    float yEntry;
+    float yExit;
+    if (finalVelX == 0.0) {
+        xEntry = -1.0 / 0.0;
+        xExit  =  1.0 / 0.0;
+    } else {
+        xEntry = xInvEntry / finalVelX;
+        xExit  = xInvExit / finalVelX;
+
+        if (yInvEntry * -sign(finalVelY) >= 0.0 && xEntry < -1.0) {
+            xEntry = -1.0 / 0.0;
+            xExit  =  1.0 / 0.0;
+        }
+    }
+    if (finalVelY == 0.0) {
+        yEntry = -1.0 / 0.0;
+        yExit  =  1.0 / 0.0;
+    } else {
+        yEntry = yInvEntry / finalVelY;
+        yExit  = yInvExit / finalVelY;
+
+        if (xInvEntry * -sign(finalVelX) >= 0.0 && yEntry < -1.0) {
+            yEntry = -1.0 / 0.0;
+            yExit  =  1.0 / 0.0;
+        }
+    }
+
+
+    float entryTime = max(xEntry, yEntry);
+    float exitTime  = min(xExit, yExit);
+    if (sign(entryTime) == sign(exitTime) && abs(entryTime) > abs(exitTime) || entryTime > exitTime
+            || entryTime > 0.0
+            || xEntry < -1.0 && !isinf(xEntry) || yEntry < -1.0 && !isinf(yEntry)) {
+        result.normal        = vec2(0.0, 0.0);
+        result.collisionTime = 1.0;
+    } else {
+        if (xEntry == entryTime) {
+            float normalX = abs(box0VelX) > abs(box1VelX) ? -sign(box0VelX) : sign(box1VelX);
+            result.normal = vec2(normalX, 0.0);
+        } else {
+            float normalY = abs(box0VelY) > abs(box1VelY) ? -sign(box0VelY) : sign(box1VelY);
+            result.normal = vec2(0.0, normalY);
+        }
+        result.collisionTime = entryTime;
+    }
+
+    return result;
+}
+
+void setPosition(inout Particle particle, vec2 position) {
+    particle.position        = position;
+    particle.prevBoundingBox = particle.currBoundingBox;
+    particle.currBoundingBox = createParticleBoundingBox(particle.position, particle.size);
+}
+
+void correctThePositionABy(inout Particle particle, vec2 velocity) {
+    particle.position        += velocity;
+    particle.currBoundingBox  = createParticleBoundingBox(particle.position, particle.size);
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+
+    Particle particleIn = particlesIn[index];
+    if (particleIn.color.a <= 0.0 && particlesOut[index].color.a <= 0.0) {
+        return;
+    }
+
+    float particleCurrDeltaTime;
+    Particle particleOut;
+    if (particlesOut[index].color.a == 1.0) {
+        particleCurrDeltaTime = ubo.particleCurrDeltaTime;
+        particleOut           = particlesOut[index];
+    } else {
+        particleCurrDeltaTime = ubo.currDeltaTime;
+        particleOut           = particleIn;
+        vec2 newPosition      = particleOut.position + particleOut.currVelocity * particleCurrDeltaTime;
+        setPosition(particleOut, newPosition);
+    }
+
+    vec2 updatedVelocity = particleOut.currVelocity;
+
+    float halfSize = particleOut.size / 2;
+    if (particleOut.currBoundingBox.minX < 0.0) {
+        vec2 newPosition = vec2(halfSize, particleOut.position.y);
+        setPosition(particleOut, newPosition);
+
+        updatedVelocity.x *= -1;
+    } else if (particleOut.currBoundingBox.maxX > ubo.worldWidth) {
+        vec2 newPosition = vec2(ubo.worldWidth - halfSize, particleOut.position.y);
+        setPosition(particleOut, newPosition);
+
+        updatedVelocity.x *= -1;
+    }
+    if (particleOut.currBoundingBox.minY < 0.0) {
+        vec2 newPosition = vec2(particleOut.position.x, halfSize);
+        setPosition(particleOut, newPosition);
+
+        updatedVelocity.y *= -1;
+    } else if (particleOut.currBoundingBox.maxY >= ubo.worldHeight) {
+        vec2 newPosition = vec2(particleOut.position.x, ubo.worldHeight - halfSize);
+        setPosition(particleOut, newPosition);
+
+        updatedVelocity.y *= -1;
+    }
+
+    for (int i = 0; i < worldEntities.length(); i++) {
+        // NOTE: This 'hack' compensates for that single frame where the entity's velocity non realistically changes. The reason
+        //  why it's not taken into account in the correction logic on the CPU is because the CPU represents the actual
+        //  continuous authoritative truth (history) even if that truth does not behave physically correct which leads to some edge cases.
+        //  This might be an objectively wrong design decision, but it works within the bounds of this Pong game. (2025-11-18)
+        vec2 neededEntityCurrVel;
+        vec2 neededEntityPrevVelDT;
+        if (sign(worldEntities[i].currVelocity.x) != sign(worldEntities[i].prevVelocity.x)
+                || sign(worldEntities[i].currVelocity.y) != sign(worldEntities[i].prevVelocity.y)) {
+            neededEntityCurrVel   = worldEntities[i].prevVelocity;
+            neededEntityPrevVelDT = worldEntities[i].prevPrevVelocity * ubo.prevPrevDeltaTime;
+        } else {
+            neededEntityCurrVel   = worldEntities[i].currVelocity;
+            neededEntityPrevVelDT = worldEntities[i].prevVelocity * ubo.prevDeltaTime;
+        }
+
+        BoundingBox particleSweptBroadphaseBox = createSweptBoundingBox(particleOut.prevBoundingBox, particleOut.currBoundingBox);
+        BoundingBox entitySweptBroadphaseBox   = createSweptBoundingBox(worldEntities[i].prevBoundingBox, worldEntities[i].currBoundingBox);
+        if (!doCollide(particleSweptBroadphaseBox, entitySweptBroadphaseBox)) {
+            continue;
+        }
+
+        // NOTE: Using velocities to construct swept bounding boxes for the positions that are not directly adjacent to the
+        //    current temporal frame is valid because they don't get affected by current state changes. The benefit of
+        //    this approach is that it uses less GPU bandwidth. (type of velocity is [2]f32, while the type of bounding box is [4]f32)
+        //   Reasoning is that, even though using only bounding boxes would be more accurate, I don't need that accuracy
+        //    for prevPrev swept bounding boxes. I just need it to determine if there was a prior collision for the sake of
+        //    ignoring the current collision.
+        //   One of the edge cases where the prevSweptBoundingBox could be innacurate is where the prevPrev ball state was that of a bounce,
+        //    which would make the actual prevSweptBoundingBox be smaller than this approximation. But that level of
+        //    accuracy is not needed for this use case. (2025-11-28)
+        BoundingBox particlePrevSweptBroadphaseBox = createSweptBoundingBox(particleOut.prevBoundingBox, -particleOut.prevVelocityDeltaTimed);
+        BoundingBox entityPrevSweptBroadphaseBox   = createSweptBoundingBox(worldEntities[i].prevBoundingBox, -neededEntityPrevVelDT);
+        if (doCollide(particlePrevSweptBroadphaseBox, entityPrevSweptBroadphaseBox)) {
+            continue;
+        }
+
+        // NOTE: Using a broadphase box directly in the Swept AABB algorithm instead of using a bounding box enables
+        //  the ball to be continuously pushed. (2025-10-28)
+        SwapAABBResult res = sweptAABB(particleSweptBroadphaseBox, entitySweptBroadphaseBox, particleOut.currVelocity, neededEntityCurrVel);
+
+        vec2 relVelocity   = particleOut.currVelocity - neededEntityCurrVel;
+        vec2 finalVelocity = (abs(relVelocity * res.collisionTime) + ubo.epsilon) * res.normal;
+        correctThePositionABy(particleOut, finalVelocity);
+
+        if (res.normal.x != 0.0) {
+            updatedVelocity.x = abs(particleOut.currVelocity.x) * res.normal.x;
+        } else if (res.normal.y != 0.0) {
+            updatedVelocity.y = abs(particleOut.currVelocity.y) * res.normal.y;
+        }
+    }
+
+    particleOut.color.a                -= ubo.currDeltaTime * 2;
+    particleOut.prevVelocityDeltaTimed  = particleOut.currVelocity * particleCurrDeltaTime;
+    particleOut.currVelocity            = updatedVelocity;
+
+    particlesOut[index] = particleOut;
+}
